@@ -2,7 +2,7 @@
 
 import urllib.request as req
 import urllib.parse as urlparse
-import urllib.urlencode as urlencode
+from urllib.parse import urlencode
 from datetime import date, datetime, timedelta
 from collections import defaultdict
 from bisect import bisect
@@ -82,23 +82,6 @@ def extract_date( course ) :
     duration = timedelta(hours=int(hour), minutes=int(minute))
     return ( date, duration )
 
-def RepresentsInt(s):
-    try: 
-        int(s)
-        return True
-    except ValueError:
-        return False
-
-def parse_project( project ) :
-    if RepresentsInt( project ) :
-        return int( project )
-    else :
-        pids = get_projects()
-        if project in pids :
-            return pids[project]
-        else :
-            raise argparse.ArgumentTypeError('"' + str(project) + '"' + " is not a valid project.")
-
 def normalize( cal ):
     normal = []
 
@@ -116,33 +99,23 @@ def normalize( cal ):
 
 
 ### Extraction functions
-class session_opener():
+def follow_javascript_redirections( opener, url ) :
+    """ Make requests untill no evident javascript redirection is required """
+    while True :
+        myreq = opener.open(url) 
+        html = BeautifulSoup(myreq)
+        # search for document.location = <url> in all script tags.
+        scripts = "".join( x.text for x in html("script") )
+        result = re.search( "document.location *= *'((?:(?:\\.)?[^\\'])*)'", scripts )
 
-    def __init__( self, url ):
-        self.opener = req.build_opener( req.HTTPCookieProcessor() )
-        self.open( url )
-    
-    def open( url ):
-        target_url = follow_js_redir( url )
-        return self.opener.open( target_url )
+        if result == None : 
+            break
+        
+        path = result.group(1)
+        url = urlparse.urljoin(myreq.geturl(), path)
+        logger.debug( "REDIRECTED : " + url )
 
-    def follow_js_redir( url ) :
-        """ Make requests untill no evident javascript redirection is required """
-        while True :
-            myreq = self.opener.open(url) 
-            html = BeautifulSoup(myreq)
-            # search for document.location = <url> in all script tags.
-            scripts = "".join( x.text for x in html("script") )
-            result = re.search( "document.location *= *'((?:(?:\\.)?[^\\'])*)'", scripts )
-
-            if result == None : 
-                break
-            
-            path = result.group(1)
-            url = urlparse.urljoin(myreq.geturl(), path)
-            logger.debug( "REDIRECTED : " + url )
-
-        return url
+    return url
 
 def get_projects() :
     ''' Extract currently active projects from ADE.
@@ -151,45 +124,36 @@ def get_projects() :
     url_projects = domain + "/ade/standard/projects.jsp"
     url_login = url + "direct_planning.jsp?login=etudiant&password=student"
 
+    # open session 
+    opener = req.build_opener( req.HTTPCookieProcessor() )
+    opener.open(url_login)
 
     # extract projects
-    projects = session_opener().open( url_projects )
+    projects = opener.open( url_projects )
     html = BeautifulSoup(projects.read())
 
-    # zip names and ID's together in a map
+    # zip names and ID's together in a dict
     return dict( (x.text.strip(), x['value']) for x in  html("option") )
 
-_mem = {} # a var for memoization in get_full_name(...)
-class Memoize:
-    def __init__(self, f):
+_memo = {} # a var for memoization in get_course_name(...)
+def get_course_name(code, ID, opener):
 
-class get_course_name():
-    def __init__(self):
-        self.memo = {}
+    # use memoization to avoid useless html queries 
+    if code in _memo : return _memo[code]
 
-    def get_course_name(name, ID, opener):
+    # When not memoized, request ADE eventInfo page
+    data = opener.open(url + "eventInfo.jsp?eventId=%s&noMenu=true" % ID )
+    html = BeautifulSoup(data)
+    full_name = html("label")[0].text.split("Code:")[1].strip()
+    logger.debug( "Full name of %s is %s" % (code, full_name) )
 
-        # use memoization to avoid useless html queries 
-        if code in self.memo : return self.memo[code]
+    # Allow user to enter another name for the course.
+    # That namewill be memoized instead.
+    final = input('Enter name for %s\n[%s] : ' % (code, full_name) ) or full_name
 
-        # When not memoized, request ADE eventInfo page
-        data = opener.open(url + "eventInfo.jsp?eventId={}&noMenu=true".format(ID))
-        html = BeautifulSoup(data)
-        full_name = html("label")[0].text.split("Code:")[1]
-        logger.debug( "Full name of {} is {}".format( code, full_name) )
-
-        # Allow user to enter another name for the course.
-        # That namewill be memoized instead.
-        final = input('Enter name for {}\n[{}] : '.format( code, full_name ))
-        final = final or full_name
-
-        # Memoize the result
-        _mem[code] = final
-
-        # Recurse call now that memoization is active.
-        return get_full_name(name, ID, opener)
-
-   
+    # Memoize the result
+    _memo[code] = final
+    return final
 
 def get_full_name( name, ID, opener) :
     """Convert raw courses codes into human-redable name"""
@@ -200,57 +164,56 @@ def get_full_name( name, ID, opener) :
     elif '_' in name :
         code, extra = tuple(name.split('_'))
         extra = " - TP " + extra
-    elif '=E' in name :
-        code, extra = tuple(name.split('=E'))
-        extra = " - EXAMEN " + extra
+    elif '=' in name :
+        code, extra = tuple(name.split('='))
+        if extra == 'E' : extra = 'EXAM'
+        extra = " - " + extra
     else :
         code, extra = name, ""
 
     return get_course_name(code, ID, opener) + extra
 
+
+# A function to parse html event into a dictionary.
+def parse_html_event(ev, opener, full_names=False) : 
+    labels = [ "Date", "Name", "Week", "Day", "Hour", "Duration", 
+               "Trainees", "Trainers", "Rooms", "Equipment",
+               "Course", "Teams", "Category7", "Category8" ]
+
+    event = [ item.text.strip() for item in ev ]
+    event = dict( zip(labels,event) )
+    
+    if full_names :
+        href = ev("td")[1].a["href"]
+        event["ID"] = re.search(r'\d+', href).group()
+        event["FullName"] = get_full_name(event['Name'], event['ID'], opener)
+    else :
+        event["FullName"] = event['Name'] 
+    
+    return event
+
 def get_raw_data(codes, pid, weeks, full_names=False) :
     """Extract all events dates from courses codes.
     Use ADE project pid, and restrict to weeks weeks.
     If human-readable names are preffered, use full_names switch."""
-    query = ( url + 
-        "direct_planning.jsp?" + 
-        "weeks={weeks}&code={codes}&login=etudiant&password=student&projectId={pid}" )
-    url_query = query.format( weeks = weeks, codes = codes, pid = pid )
-    url_query = url_query.replace('&projectId=None', '') # sanitize undefined projects ;)
-    logger.debug( "full query : " + url_query )
 
+    params = {"weeks":weeks, "code":','.join(codes), "login":"etudiant", "password":"student"}
+    if pid != None : params["projectId"] = pid
+
+    url_query = ( url + "direct_planning.jsp?" + urlencode(params) )
     url_data = url + "info.jsp?horaire=slot" 
-    logger.debug( "data query : " + url_data )
-
-    labels = [ "Date", "Name", "Week", "Day", "Hour", "Duration", 
-            "Trainees", "Trainers", "Rooms", "Equipment",
-            "Course", "Teams", "Category7", "Category8" ]
-    labels_fr = [ "Date", "Nom", "Semaine", "Jour", "Heure", "Durée", 
-            "Stagiaires", "Formateurs", "Salles", "Équipements",
-            "Cours", "Équipes", "Catégorie7","Catégorie8" ] 
-
+    
     # Create session cookies and obtain data.
     opener = req.build_opener( req.HTTPCookieProcessor() )
     follow_javascript_redirections(opener, url_query)
 
     raw_data = BeautifulSoup(opener.open(url_data))
-    data = raw_data("tr")[2:]
-    logger.debug(data[0])
-
-    # A function to parse html event into a dictionary.
-    def conv_ev(ev) : 
-        def conv_td(item) : return item.text
-        event = dict(zip(labels, map( conv_td, ev)))
-        href = ev("td")[1].a["href"]
-        event["ID"] = re.search(r'\d+', href).group() 
-        if full_names :
-            event["FullName"] = get_full_name(event['Name'], event['ID'], opener) 
-        else : 
-            event["FullName"] = event['Name'] 
-        return event
+    data = raw_data("tr")[2:] # table contains two unusable headers
+    if (len(data) > 0 ) :
+        logger.debug(data[0])
 
     # Return a list of converted events.
-    return list(map( conv_ev, data ))
+    return [ parse_html_event( ev, opener, full_names ) for ev in data ]
 
 def ical_datetime( t ) :
     return ("{0.year:0>4}{0.month:0>2}{0.day:0>2}T" +
@@ -271,31 +234,32 @@ def get_RRule( courses ) :
     holes = sorted( list( set(ordered) - set(dates) ))
     inorder = sorted( list( set(ordered) - set(holes) ))
 
-    # Remove holes afther the last RRULE occurence
+    # Remove holes after the last RRULE occurence (not really holes then :)
     cut = bisect(holes, inorder[-1])
     weeks = weeks - len( holes[cut:] )
     assert weeks >= 0
     holes = holes[:cut]
 
-    # Declare custom vars to shorten event creation afther.
-    uid = courses[0]['Name'].replace(' ', '') + "_" + str(hash(frozenset(courses[0].items())))[:4]
+    # Declare custom vars to shorten event creation step.
+    uid = (courses[0]['Name'].replace(' ', '') + "_" + 
+            str(hash(frozenset(courses[0].items())))[:6] )
     start = dates[0]
     desc = courses[0]
     duration = str(start[1]).split(':')
 
-    hole_dates = ",".join( list(map( lambda x : ical_datetime(x[0]), holes)))   
-    if hole_dates != "" :
+    hole_dates = ",".join( list(map( lambda x : ical_datetime(x[0]), holes)))
+    if len(holes) > 0 :
         hole_dates = "EXDATE;TZID=\"Bruxelles, Copenhague, Madrid, Paris\":" + hole_dates
 
     ex_dates = ",".join( list(map( lambda x : ical_datetime(x[0]), exceptions)))   
-    if ex_dates != "" : 
-        ex_dates = "RDATE;VALUE=DATE;TZID=\"Bruxelles, Copenhague, Madrid, Paris\":" + ex_dates
+    if len(exceptions) > 0 : 
+        ex_dates = 'RDATE;VALUE=DATE;TZID="Bruxelles, Copenhague, Madrid, Paris":' + ex_dates
 
-    logger.debug( "\"{}\"({}) :\t{:>2} week(s) with {} hole(s) and {} exception(s).".format(
+    logger.debug( '"{}"({}) :\t{:>2} week(s) with {} hole(s) and {} exception(s).'.format(
         desc['FullName'], desc['Name'], weeks, len(holes), len(exceptions) ) )
     
 
-    # build rrule
+    # build Vevent
     event = [
     "BEGIN:VEVENT", 
     "UID:" + uid,
@@ -307,28 +271,44 @@ def get_RRule( courses ) :
     "DURATION:PT{0}H{1}M{2}S".format( *duration )]
     if len(dates) > 1 :
         event.append( "RRULE:FREQ=WEEKLY;COUNT=" + str( weeks ) )
-    if hole_dates != "" :
+    if len(holes) > 0 :
         event.append( hole_dates )
-    if ex_dates != "" : 
+    if len(exceptions) > 0 : 
         event.append( ex_dates )
     event.append("END:VEVENT")
 
     return event
 
 
+def parse_project( project ) :
+    if project.isdigit():
+        return project
+    else :
+        pids = get_projects()
+        if project in pids :
+            return pids[project]
+        else :
+            raise argparse.ArgumentTypeError('"' + project + '" is not a valid project.')
+
 def parse_args() :
     parser = argparse.ArgumentParser(description='Extract generic calendar from ADE.')
-    parser.add_argument('courses', type=str, help='list of courses codes to import from ADE (e.g. LFSAB1402)',
-                        nargs="+", metavar="<course code>")
+    parser.add_argument('courses', type=str, nargs="+", metavar="<course code>",
+                        help='list of courses codes to import from ADE (e.g. LFSAB1402)')
     parser.add_argument('-p', '--project', type=parse_project,
                         required=False, default=None, dest='pid',
-                        help='an ADE project descriptor, <int> or <year>-<year+1>.')
+                        help='an ADE project descriptor, <int> or <year>-<year+1>')
     parser.add_argument('-n','--full-names', required=False, dest='full_names', 
                         default=False, action='store_true', 
-                        help="use course names instead of codes (slower).")
+                        help="use course names instead of codes (slower)")
     parser.add_argument('-o', '--outfile', required=False, type=argparse.FileType('w'),
-                        default="ade.ics", help="file to write calendar to. Defaults to ade.ics")
-    parser.add_argument('-q', '--quadrimestre', type=int, required=False, default=None) 
+                        default='-', help="output file (defaults to stdout)")
+    parser.add_argument('--debug', action='store_true', default=False, required=False,
+                        help='enable debugging information')
+    parser.add_argument('-q', metavar="quarter", type=int, required=False, 
+                        default=0, choices=[-3, -2, -1, 0, 1, 2, 3],
+                        help=" ".join(["extract only dates in this quarter",
+                        "(any of 1, 2, 3; use -i to exclude i,",
+                        "so -3 is equivalent to 1 and 2; defaults to 0 == whole year)"]) )
 
     args = parser.parse_args()
 
@@ -336,28 +316,25 @@ def parse_args() :
     if args.pid == None :
         args.pid = get_project(get_projects())
 
-    args.courses = ",".join(args.courses)
+    # barbaric, but efficient ;)
+    args.courses = ",".join(args.courses).split(',') 
+
+    # TODO : Handle -q argument
+    # wekks ranges from 0 (first academic week (a priori ;) )
+    # to 51, last week before next year.
+    # splitting quadrimesters is hard if some week gets inserted...
+    # a priori : 0 -> (14 (cours) + 2 (blocus) + 2 (exams) + 1 (vacances) )
+    # la semaine de vacances étant utilisée au cas où il y aurait un shift une année.
+    # Q2 = (fin Q1 - 1 pour être sûr) + 14 (cours)+ 2 (vacances) + ? bloc + exams)
+    # Q3 = tt le reste, uniquement utile pour les examens.
+    #
+    # par défault, on met 0-51
+    args.weeks = ",".join( map( str, range(52) ) )
 
     return args
 
-
-if __name__ == "__main__" :
-
-    args = parse_args() 
-    logger.debug(args)
-
-    logger.setLevel('DEBUG')
-
-    weeks = ",".join( map( str, range(40)) )
-    raw = get_raw_data(args.courses, args.pid, weeks, args.full_names)
-
-    courses = defaultdict(list)
-    for l in raw :
-        courses[l['FullName']].append( l )
-
-    evs = 0
-    cal = '''BEGIN:VCALENDAR
-VERSION:2.0" )
+header = '''BEGIN:VCALENDAR
+VERSION:2.0
 PRODID:ADE.PY//1.0
 CALSCALE:GREGORIAN
 METHOD:PUBLISH
@@ -377,17 +354,48 @@ TZNAME:Paris\, Madrid (heure d'été)
 TZOFFSETFROM:+0100
 TZOFFSETTO:+0200
 END:DAYLIGHT
-END:VTIMEZONE'''.split("\n")
+END:VTIMEZONE'''
+
+def make_cal(courses, pid, weeks, full_names=False) :
+    raw = get_raw_data(courses, pid, weeks, full_names)
+
+    found = dict( (c,0) for c in courses )
+    courses = defaultdict(list)
+    for l in raw :
+        courses[l['FullName']].append( l )
+        found[l["Course"]] = found[l["Course"]] + 1
+
+    for course, count in found.items():
+        if count == 0:
+            logger.warning("No event scheduled for " + course)
+
+    events = 0
+    cal = header.split("\n")
     for name, cs in courses.items() :
         cal = cal + get_RRule( cs )
-        evs = evs + 1
+        events = events + 1
     cal.append( "END:VCALENDAR" )
 
-    cal = normalize( cal )
+    return (normalize( cal ), events)
+
+
+if __name__ == "__main__" :
+
+    args = parse_args() 
+
+    if args.debug : logger.setLevel('DEBUG')
+    else : logger.setLevel('INFO')
+    logger.debug(args)
+
+    cal, events = make_cal(args.courses, args.pid, args.weeks, args.full_names)
+    
+    if (events == 0):
+        logger.error("No event found. Did you misspel some course code ?")
+        sys.exit(-1)
     
     logger.info( "Writing calendar to " + args.outfile.name + "." )
     args.outfile.write( cal )
-    logger.info( str(evs) + " event(s) written." )
-
+    logger.info( str(events) + " event(s) written." )
+    
 
 
