@@ -12,6 +12,7 @@ import logging
 import re
 import os
 import posixpath
+import itertools
 # requires install :
 from bs4 import BeautifulSoup
 
@@ -79,6 +80,7 @@ def extract_date( course ) :
         minute = '0'
     else :
         minute = minute.split("min")[0]
+
     duration = timedelta(hours=int(hour), minutes=int(minute))
     return ( date, duration )
 
@@ -217,9 +219,28 @@ def get_raw_data(codes, pid, weeks, full_names=False) :
 
 def ical_datetime( t ) :
     return ("{0.year:0>4}{0.month:0>2}{0.day:0>2}T" +
-            "{0.hour:0>2}{0.minute:0>2}{0.second:0>2}Z").format(t)
+            "{0.hour:0>2}{0.minute:0>2}{0.second:0>2}").format(t)
+
+def partition(pred, iterable):
+    'Use a predicate to partition entries into false entries and true entries'
+    # partition(is_odd, range(10)) --> 0 2 4 6 8   and  1 3 5 7 9
+    t1, t2 = itertools.tee(iterable)
+    return ( filter(pred, t1), itertools.filterfalse(pred, t2) )
 
 def get_RRule( courses ) :
+    """ Split courses according to duration """
+    # This is needed as RDATE;VALUE=PERIOD;... is not supported by most online calendars.
+    if not courses : return []
+
+    ok, others = partition( lambda x: (x["Duration"] == courses[0]["Duration"] ) , courses )
+    ok, others = list(ok), list(others)
+     
+    if others : 
+        logger.warning( "Event %s must be split because it contains different durations" % courses[0]["FullName"] )
+
+    return build_RRule( ok ) + get_RRule( others )
+
+def build_RRule( courses ):
     dates = list( map( extract_date, courses) )
     dates.sort()
     
@@ -247,11 +268,11 @@ def get_RRule( courses ) :
     desc = courses[0]
     duration = str(start[1]).split(':')
 
-    hole_dates = ",".join( list(map( lambda x : ical_datetime(x[0]), holes)))
+    hole_dates = ",".join( ical_datetime(e[0]) for e in holes )
     if len(holes) > 0 :
         hole_dates = "EXDATE;TZID=\"Bruxelles, Copenhague, Madrid, Paris\":" + hole_dates
 
-    ex_dates = ",".join( list(map( lambda x : ical_datetime(x[0]), exceptions)))   
+    ex_dates = ",".join( ical_datetime(e[0]) for e in exceptions )   
     if len(exceptions) > 0 : 
         ex_dates = 'RDATE;VALUE=DATE;TZID="Bruxelles, Copenhague, Madrid, Paris":' + ex_dates
 
@@ -301,7 +322,7 @@ def parse_args() :
                         default=False, action='store_true', 
                         help="use course names instead of codes (slower)")
     parser.add_argument('-o', '--outfile', required=False, type=argparse.FileType('w'),
-                        default='-', help="output file (defaults to stdout)")
+                        default='ade.ics', help="output file (defaults to 'ade.ics')")
     parser.add_argument('--debug', action='store_true', default=False, required=False,
                         help='enable debugging information')
     parser.add_argument('-q', metavar="quarter", type=int, required=False, 
